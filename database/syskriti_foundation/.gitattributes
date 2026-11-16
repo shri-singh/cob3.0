@@ -1,0 +1,4 @@
+# Keep generated SQL byte-stable across platforms (installer checksum is computed on LF text).
+*.sql text eol=lf
+*.template text eol=lf
+*.py text eol=lf

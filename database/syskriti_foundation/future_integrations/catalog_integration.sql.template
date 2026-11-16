@@ -1,0 +1,164 @@
+-- =============================================================================
+-- SYSKRITI FOUNDATION -- CATALOG INTEGRATION (FUTURE, SEPARATELY INVOKED)
+-- -----------------------------------------------------------------------------
+-- NEVER part of INSTALL_FOUNDATION.sql. Run only after the Catalog module has
+-- created cob3_catalog.domains / cob3_catalog.assets per
+-- catalog_integration_contract.md. Rename to .sql when adopting it, review the
+-- resolver semantics against the real Catalog, and run as the migration role
+-- (member of cob3_owner).
+--
+-- One atomic DO statement: verification happens first; if anything is
+-- missing or inconsistent it raises SKCAT and changes nothing. Real FKs are
+-- installed and validated, the trusted resolver replaces the fail-closed
+-- guards, and only then are domain/asset operations enabled.
+-- =============================================================================
+DO $catalog_integration$
+DECLARE
+    v_missing text;
+    v_bad     bigint;
+BEGIN
+    -- 1. Preconditions -------------------------------------------------------
+    IF pg_catalog.to_regclass('cob3_tenant.foundation_installations') IS NULL
+       OR NOT EXISTS (SELECT 1 FROM cob3_tenant.foundation_installations WHERE component = 'foundation' AND version = '1.0.0') THEN
+        RAISE EXCEPTION USING ERRCODE = 'SKCAT', MESSAGE = 'Syskriti foundation 1.0.0 is not installed in this database.';
+    END IF;
+    IF EXISTS (SELECT 1 FROM cob3_tenant.foundation_installations WHERE component = 'catalog_integration') THEN
+        RAISE NOTICE 'Catalog integration already installed; nothing changed.';
+        RETURN;
+    END IF;
+    IF NOT pg_catalog.pg_has_role(current_user, 'cob3_owner', 'MEMBER') THEN
+        RAISE EXCEPTION USING ERRCODE = 'SKCAT', MESSAGE = 'Run as a migration role that is a member of cob3_owner.';
+    END IF;
+    SELECT pg_catalog.string_agg(x.need, ', ') INTO v_missing
+      FROM (VALUES ('domains', 'tenant_id', 'uuid'), ('domains', 'organization_id', 'uuid'), ('domains', 'domain_id', 'uuid'),
+                   ('domains', 'status', 'character varying'),
+                   ('assets', 'tenant_id', 'uuid'), ('assets', 'organization_id', 'uuid'), ('assets', 'asset_id', 'uuid'),
+                   ('assets', 'resource_type', 'character varying'), ('assets', 'primary_domain_id', 'uuid'),
+                   ('assets', 'status', 'character varying')) AS r(tbl, col, typ)
+      CROSS JOIN LATERAL (SELECT 'cob3_catalog.' || r.tbl || '.' || r.col || ' ' || r.typ AS need) x
+     WHERE NOT EXISTS (SELECT 1 FROM information_schema.columns c
+                        WHERE c.table_schema = 'cob3_catalog' AND c.table_name = r.tbl
+                          AND c.column_name = r.col AND c.data_type = r.typ);
+    IF v_missing IS NOT NULL THEN
+        RAISE EXCEPTION USING ERRCODE = 'SKCAT', MESSAGE = 'Catalog contract not satisfied; missing: ' || v_missing;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k
+                    WHERE k.conrelid = 'cob3_catalog.domains'::regclass AND k.contype IN ('p', 'u')
+                      AND k.conkey::int2[] @> ARRAY(SELECT a.attnum FROM pg_catalog.pg_attribute a WHERE a.attrelid = k.conrelid AND a.attname IN ('tenant_id', 'organization_id', 'domain_id'))::int2[]
+                      AND pg_catalog.array_length(k.conkey, 1) = 3)
+       OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_constraint k
+                    WHERE k.conrelid = 'cob3_catalog.assets'::regclass AND k.contype IN ('p', 'u')
+                      AND k.conkey::int2[] @> ARRAY(SELECT a.attnum FROM pg_catalog.pg_attribute a WHERE a.attrelid = k.conrelid AND a.attname IN ('tenant_id', 'organization_id', 'asset_id'))::int2[]
+                      AND pg_catalog.array_length(k.conkey, 1) = 3) THEN
+        RAISE EXCEPTION USING ERRCODE = 'SKCAT', MESSAGE = 'Catalog composite keys (tenant_id, organization_id, domain_id/asset_id) are missing.';
+    END IF;
+    IF NOT pg_catalog.has_table_privilege('cob3_owner', 'cob3_catalog.domains', 'SELECT, REFERENCES')
+       OR NOT pg_catalog.has_table_privilege('cob3_owner', 'cob3_catalog.assets', 'SELECT, REFERENCES')
+       OR NOT pg_catalog.has_schema_privilege('cob3_owner', 'cob3_catalog', 'USAGE') THEN
+        RAISE EXCEPTION USING ERRCODE = 'SKCAT', MESSAGE = 'cob3_owner needs USAGE on cob3_catalog and SELECT, REFERENCES on domains and assets.';
+    END IF;
+    SELECT (SELECT COUNT(*) FROM cob3_identity.access_scopes WHERE scope_type IN ('domain', 'asset'))
+         + (SELECT COUNT(*) FROM cob3_identity.team_domains) INTO v_bad;
+    IF v_bad > 0 THEN
+        RAISE EXCEPTION USING ERRCODE = 'SKCAT',
+            MESSAGE = pg_catalog.format('%s pre-existing domain/asset rows found although guards should have rejected them; investigate.', v_bad);
+    END IF;
+
+    PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true);
+    SET LOCAL ROLE cob3_owner;
+
+    -- 2. Real foreign keys (added NOT VALID, then validated) --------------------
+    ALTER TABLE cob3_identity.access_scopes
+        ADD CONSTRAINT access_scopes_domain_fk FOREIGN KEY (tenant_id, organization_id, domain_id)
+            REFERENCES cob3_catalog.domains (tenant_id, organization_id, domain_id) ON UPDATE RESTRICT ON DELETE RESTRICT NOT VALID,
+        ADD CONSTRAINT access_scopes_asset_fk FOREIGN KEY (tenant_id, organization_id, asset_id)
+            REFERENCES cob3_catalog.assets (tenant_id, organization_id, asset_id) ON UPDATE RESTRICT ON DELETE RESTRICT NOT VALID;
+    ALTER TABLE cob3_identity.team_domains
+        ADD CONSTRAINT team_domains_domain_fk FOREIGN KEY (tenant_id, organization_id, domain_id)
+            REFERENCES cob3_catalog.domains (tenant_id, organization_id, domain_id) ON UPDATE RESTRICT ON DELETE RESTRICT NOT VALID;
+    ALTER TABLE cob3_identity.access_scopes VALIDATE CONSTRAINT access_scopes_domain_fk;
+    ALTER TABLE cob3_identity.access_scopes VALIDATE CONSTRAINT access_scopes_asset_fk;
+    ALTER TABLE cob3_identity.team_domains VALIDATE CONSTRAINT team_domains_domain_fk;
+
+    -- 3. Trusted resolver replaces the fail-closed guards ----------------------
+    CREATE OR REPLACE FUNCTION cob3_identity.assert_catalog_domain(p_tenant_id uuid, p_organization_id uuid, p_domain_id uuid)
+        RETURNS void LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+    AS $fn$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM cob3_catalog.domains d
+                        WHERE d.tenant_id = p_tenant_id AND d.organization_id = p_organization_id
+                          AND d.domain_id = p_domain_id AND d.status = 'active') THEN
+            RAISE EXCEPTION USING ERRCODE = 'SKCAT', MESSAGE = 'Unknown or inactive Catalog domain for this organization.';
+        END IF;
+    END
+    $fn$;
+
+    CREATE OR REPLACE FUNCTION cob3_identity.assert_catalog_asset(p_tenant_id uuid, p_organization_id uuid, p_asset_id uuid)
+        RETURNS void LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+    AS $fn$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM cob3_catalog.assets a
+                        WHERE a.tenant_id = p_tenant_id AND a.organization_id = p_organization_id
+                          AND a.asset_id = p_asset_id AND a.status = 'active') THEN
+            RAISE EXCEPTION USING ERRCODE = 'SKCAT', MESSAGE = 'Unknown or inactive Catalog asset for this organization.';
+        END IF;
+    END
+    $fn$;
+
+    CREATE OR REPLACE FUNCTION cob3_identity.catalog_scope_covers(
+            p_tenant_id uuid, p_organization_id uuid, p_scope_type text, p_domain_id uuid, p_asset_id uuid,
+            p_include_contained_assets boolean, p_team_id uuid, p_resource_type text,
+            p_target_type text, p_target_id uuid, p_at timestamptz)
+        RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+    AS $fn$
+        WITH target_domain AS (
+            SELECT d.domain_id FROM cob3_catalog.domains d
+             WHERE p_target_type = 'domain' AND d.tenant_id = p_tenant_id AND d.organization_id = p_organization_id
+               AND d.domain_id = p_target_id AND d.status = 'active'),
+        target_asset AS (
+            SELECT a.asset_id, a.primary_domain_id FROM cob3_catalog.assets a
+             WHERE p_target_type <> 'domain' AND a.tenant_id = p_tenant_id AND a.organization_id = p_organization_id
+               AND a.asset_id = p_target_id AND a.status = 'active' AND a.resource_type = p_target_type),
+        team_ok AS (
+            SELECT p_team_id IS NULL
+                OR EXISTS (SELECT 1 FROM cob3_identity.team_domains td
+                            WHERE td.tenant_id = p_tenant_id AND td.organization_id = p_organization_id
+                              AND td.team_id = p_team_id AND td.status = 'active'
+                              AND td.domain_id = COALESCE(p_domain_id, (SELECT ta.primary_domain_id FROM target_asset ta))) AS ok)
+        SELECT COALESCE(p_resource_type = p_target_type, false) AND CASE
+                 WHEN p_scope_type = 'organization' THEN
+                      p_include_contained_assets AND p_team_id IS NULL AND EXISTS (SELECT 1 FROM target_asset)
+                 WHEN p_scope_type = 'domain' THEN
+                      (EXISTS (SELECT 1 FROM target_domain t WHERE t.domain_id = p_domain_id)
+                       OR (p_include_contained_assets AND EXISTS (SELECT 1 FROM target_asset t WHERE t.primary_domain_id = p_domain_id)))
+                      AND (SELECT ok FROM team_ok)
+                 WHEN p_scope_type = 'asset' THEN
+                      EXISTS (SELECT 1 FROM target_asset t WHERE t.asset_id = p_asset_id)
+                      -- Reject asset team bindings when the asset has no primary domain.
+                      AND (p_team_id IS NULL OR EXISTS (SELECT 1 FROM target_asset t WHERE t.primary_domain_id IS NOT NULL))
+                      AND (SELECT ok FROM team_ok)
+                 ELSE false
+               END
+    $fn$;
+
+    CREATE OR REPLACE FUNCTION cob3_identity.catalog_integration_installed()
+        RETURNS boolean LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp
+    AS $fn$ SELECT true $fn$;
+
+    COMMENT ON FUNCTION cob3_identity.catalog_scope_covers(uuid, uuid, text, uuid, uuid, boolean, uuid, text, text, uuid, timestamptz) IS
+        'Trusted Catalog resolver installed by catalog_integration: resolves domain/asset scope membership from cob3_catalog (active rows, same tenant and organization).';
+    COMMENT ON COLUMN cob3_identity.access_scopes.domain_id IS 'FK access_scopes_domain_fk -> cob3_catalog.domains(tenant_id, organization_id, domain_id).';
+    COMMENT ON COLUMN cob3_identity.access_scopes.asset_id IS 'FK access_scopes_asset_fk -> cob3_catalog.assets(tenant_id, organization_id, asset_id).';
+    COMMENT ON COLUMN cob3_identity.team_domains.domain_id IS 'FK team_domains_domain_fk -> cob3_catalog.domains(tenant_id, organization_id, domain_id).';
+
+    -- 4. Record the component ---------------------------------------------------
+    INSERT INTO cob3_tenant.foundation_installations (component, version, script_checksum, server_version_num, notes)
+    VALUES ('catalog_integration', '1.0.0',
+            pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to('syskriti-catalog-integration-template-1.0.0', 'UTF8')), 'hex'),
+            pg_catalog.current_setting('server_version_num')::integer,
+            'Catalog FKs validated; trusted resolver installed; domain/asset operations enabled.');
+
+    RESET ROLE;
+    RAISE NOTICE 'Catalog integration installed: FKs validated and resolver enabled.';
+END
+$catalog_integration$;
